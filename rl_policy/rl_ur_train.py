@@ -127,26 +127,35 @@ class URDualArmTask1Env(gym.Env):
 
         # Build joint limits for mapping action in [-1, 1] -> ctrl
         limits = []
+        # Cache joint qpos/qvel addresses for proprioception in the observation.
+        # (Do not assume qpos/qvel ordering; MuJoCo layout includes the object's freejoint.)
+        self.robot_qpos_adrs = []
+        self.robot_qvel_adrs = []
         for jname in self.joint_names:
             jid = mujoco.mj_name2id(self.model, mujoco.mjtObj.mjOBJ_JOINT, jname)
             if jid < 0:
                 raise ValueError(f"Joint '{jname}' not found.")
+            self.robot_qpos_adrs.append(int(self.model.jnt_qposadr[jid]))
+            self.robot_qvel_adrs.append(int(self.model.jnt_dofadr[jid]))
             lo, hi = self.model.jnt_range[jid, 0], self.model.jnt_range[jid, 1]
             if not bool(self.model.jnt_limited[jid]):
                 lo, hi = -np.pi, np.pi
             limits.append((float(lo), float(hi)))
         self.joint_limits = np.asarray(limits, dtype=np.float32)  # (12, 2)
+        self.robot_qpos_adrs = np.asarray(self.robot_qpos_adrs, dtype=np.int64)  # (12,)
+        self.robot_qvel_adrs = np.asarray(self.robot_qvel_adrs, dtype=np.int64)  # (12,)
 
-        # Action: target joint positions in each arm (normalized)
+        # Action: normalized delta-joint command in [-1, 1]
         self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
 
-        # Rate limit joint targets to reduce "target jumps" -> contact instability.
-        # ctrl is in joint radians (mapped from action into each joint ctrlrange).
+        # Incremental control rate limit: action is scaled to delta-radians per step.
         self.max_delta_ctrl = 0.15  # rad per decision step
         self.prev_ctrl = np.zeros(12, dtype=np.float32)
 
-        # Observation: left/right tool pos+quat, object pos+quat, object vel(6)
-        obs_dim = 3 + 4 + 3 + 4 + 3 + 4 + 6
+        # Observation:
+        # robot_qpos(12) + robot_qvel(12) + lpos(3)+lquat(4) + rpos(3)+rquat(4) +
+        # rel_lpos(3)+rel_rpos(3) + object_pos(3)+object_quat(4)+object_vel(6)
+        obs_dim = 57
         self.observation_space = spaces.Box(
             low=-np.inf, high=np.inf, shape=(obs_dim,), dtype=np.float32
         )
@@ -324,9 +333,31 @@ class URDualArmTask1Env(gym.Env):
         lpos, lquat = self._get_site_pos_quat(self.left_site_id)
         rpos, rquat = self._get_site_pos_quat(self.right_site_id)
         opos, oquat, olinvel, oangvel = self._get_object_pos_quat_vel()
-        obs = np.concatenate([lpos, lquat, rpos, rquat, opos, oquat, olinvel, oangvel]).astype(
-            np.float32
-        )
+
+        # Proprioception: robot joint states (qpos/qvel) for learning kinematics.
+        robot_qpos = np.asarray(self.data.qpos[self.robot_qpos_adrs], dtype=np.float32)  # (12,)
+        robot_qvel = np.asarray(self.data.qvel[self.robot_qvel_adrs], dtype=np.float32)  # (12,)
+
+        # Relative object position w.r.t. each end-effector.
+        rel_lpos = (opos - lpos).astype(np.float32)
+        rel_rpos = (opos - rpos).astype(np.float32)
+
+        obs = np.concatenate(
+            [
+                robot_qpos,
+                robot_qvel,
+                lpos,
+                lquat,
+                rpos,
+                rquat,
+                rel_lpos,
+                rel_rpos,
+                opos,
+                oquat,
+                olinvel,
+                oangvel,
+            ]
+        ).astype(np.float32)
         return obs
 
     def _compute_reward_done(self) -> Tuple[float, bool]:
@@ -347,9 +378,11 @@ class URDualArmTask1Env(gym.Env):
             d = dR
             ori_angle = ori_angle_R
         else:
-            d = min(dL, dR)
-            # Orientation: encourage the closer arm to match object orientation
-            ori_angle = ori_angle_L if dL <= dR else ori_angle_R
+            # Avoid hard "min" switching between arms (reward gradient discontinuity).
+            # Use a smooth-ish average instead.
+            d = 0.5 * dL + 0.5 * dR
+            # Orientation: weighted average of both arms' mismatch.
+            ori_angle = 0.5 * ori_angle_L + 0.5 * ori_angle_R
 
         pos_reward = -np.arctan(d)  # [-pi/2, 0]
 
@@ -387,17 +420,21 @@ class URDualArmTask1Env(gym.Env):
         return float(reward), bool(success_now)
 
     def step(self, action):
-        ctrl_target = self._map_action_to_ctrl(action)  # (12,)
+        # Incremental delta control: action in [-1, 1] directly maps to delta joint radians.
+        a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)  # (12,)
+        delta_q = a * self.max_delta_ctrl  # (12,)
+        ctrl_target = self.prev_ctrl + delta_q
+
+        # Single-arm mode: keep the other arm fixed.
         if self.single_arm == "left":
-            # Keep right joints fixed at previous targets.
             ctrl_target[6:] = self.prev_ctrl[6:]
         elif self.single_arm == "right":
             ctrl_target[:6] = self.prev_ctrl[:6]
 
-        # Limit how much each joint target can change per decision step.
-        delta = ctrl_target - self.prev_ctrl
-        delta = np.clip(delta, -self.max_delta_ctrl, self.max_delta_ctrl)
-        ctrl = self.prev_ctrl + delta
+        # Clip to joint limits for safety.
+        lo = self.joint_limits[:, 0]
+        hi = self.joint_limits[:, 1]
+        ctrl = np.clip(ctrl_target, lo, hi).astype(np.float32)
         self.prev_ctrl = ctrl.copy()
 
         for i, aid in enumerate(self.actuator_ids):

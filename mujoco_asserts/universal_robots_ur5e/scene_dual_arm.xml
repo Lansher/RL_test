@@ -1,0 +1,112 @@
+<mujoco model="ur5e scene">
+  <include file="dual_ur5e.xml"/>
+
+  <statistic center="0.3 0 0.3" extent="0.8" meansize="0.08"/>
+
+  <visual>
+    <headlight diffuse="0.6 0.6 0.6" ambient="0.1 0.1 0.1" specular="0 0 0"/>
+    <global azimuth="120" elevation="-20"/>
+  </visual>
+
+  <asset>
+    <texture name="grid" type="2d" builtin="checker" rgb1=".2 .3 .4" rgb2=".1 0.15 0.2" width="512" height="512"
+      mark="cross" markrgb=".8 .8 .8"/>
+    <material name="grid" texture="grid" texrepeat="1 1" texuniform="true"/>
+    <!-- import dual_ur5e_base_fixed.obj-->
+    <mesh name="custom_base_mesh" file="custom/dual_ur5e_base_fixed.obj" scale="0.001 0.001 0.001"/>
+    <material name="base_mat" rgba="0.2 0.2 0.2 1"/>
+    <mesh name="custom_worktable_mesh" file="custom/worktable_fixed.obj" scale="0.001 0.001 0.001"/>
+    <material name="worktable_mat" rgba="0.2 0.2 0.2 1"/>
+  </asset>
+
+  <worldbody>
+    <light pos="0 0 1.5" directional="true"/>
+    <geom name="floor" size="3 3 0.01" type="plane" material="grid"/>
+    <body name="right_target" pos="0.5 -0.5 .5" quat="1 0 0 0" mocap="true">
+      <!-- X-axis arrow shaft -->
+      <geom name="right_target_x_shaft" type="cylinder" size="0.005 0.05" pos="0.05 0 0" zaxis="1 0 0" rgba="1 0 0 1" contype="0" conaffinity="0" group="1"/>
+      <!-- Y-axis arrow shaft -->
+      <geom name="right_target_y_shaft" type="cylinder" size="0.005 0.05" pos="0 0.05 0" zaxis="0 1 0" rgba="0 1 0 1" contype="0" conaffinity="0" group="1"/>
+      <!-- Z-axis arrow shaft -->
+      <geom name="right_target_z_shaft" type="cylinder" size="0.005 0.05" pos="0 0 0.05" zaxis="0 0 1" rgba="0 0 1 1" contype="0" conaffinity="0" group="1"/>
+      <site type="sphere" size="0.01" rgba="0 0 1 1" group="1"/>
+    </body>
+    <body name="left_target" pos="0.5 0.5 .5" quat="1 0 0 0" mocap="true">
+      <!-- X-axis arrow shaft -->
+      <geom name="left_target_x_shaft" type="cylinder" size="0.005 0.05" pos="0.05 0 0" zaxis="1 0 0" rgba="1 0 0 1" contype="0" conaffinity="0" group="1"/>
+      <!-- Y-axis arrow shaft -->
+      <geom name="left_target_y_shaft" type="cylinder" size="0.005 0.05" pos="0 0.05 0" zaxis="0 1 0" rgba="0 1 0 1" contype="0" conaffinity="0" group="1"/>
+      <!-- Z-axis arrow shaft -->
+      <geom name="left_target_z_shaft" type="cylinder" size="0.005 0.05" pos="0 0 0.05" zaxis="0 0 1" rgba="0 0 1 1" contype="0" conaffinity="0" group="1"/>
+      <site type="sphere" size="0.01" rgba="0 0 1 1" group="1"/>
+    </body>
+    <!-- X-axis arrow shaft -->
+    <geom name="world_x_shaft" type="cylinder" size="0.01 0.1" pos="0.1 0 0.0" zaxis="1 0 0" rgba="1 0 0 1" contype="0" conaffinity="0" group="1"/>
+    <!-- Y-axis arrow shaft -->
+    <geom name="world_y_shaft" type="cylinder" size="0.01 0.1" pos="0 0.1 0.0" zaxis="0 1 0" rgba="0 1 0 1" contype="0" conaffinity="0" group="1"/>
+    <!-- Z-axis arrow shaft -->
+    <geom name="world_z_shaft" type="cylinder" size="0.01 0.2" pos="0 0 0.2" zaxis="0 0 1" rgba="0 0 1 1" contype="0" conaffinity="0" group="1"/>
+
+    <!-- Rotate the imported mesh +90deg around X (quat is w x y z) -->
+    <geom name="base_vis" type="mesh" mesh="custom_base_mesh" material="base_mat" pos="0.2 0.2 0"
+          quat="0.5 0.5 -0.5 -0.5" contype="0" conaffinity="0"/>
+    <!-- Same mesh but enabled for collision -->
+    <geom name="base_col" type="mesh" mesh="custom_base_mesh" material="base_mat" pos="0.2 0.2 0"
+          quat="0.5 0.5 -0.5 -0.5"
+          contype="1" conaffinity="1" friction="1 0.01 0.001"
+          solimp="0.9 0.95 0.001" solref="0.02 1"/>
+    <body name="worktable" pos="-1.1 1.05 0">
+      <!-- 视觉工作台（不参与碰撞） -->
+      <geom name="worktable_vis" type="mesh" mesh="custom_worktable_mesh" material="worktable_mat"
+            contype="0" conaffinity="0"
+            quat="0.5 0.5 -0.5 -0.5"/>
+
+      <!-- 碰撞工作台：用 primitive 提升稳定性 -->
+      <geom name="worktable_top" type="box"
+            size="0.25 1.3 0.01115"
+            pos="0.55 -1.3 0.81"
+            material="worktable_mat"
+            friction="2 0.1 0.01"
+            solimp="0.9 0.95 0.001"
+            solref="0.02 1"
+            condim="4"
+            group="0"
+            contype="1" conaffinity="1"/>
+    </body>
+
+    <!-- 可抓取的动态物体（free joint 只能放在 worldbody 顶层） -->
+    <body name="target_object" pos="-0.8 1.05 0.81">
+      <freejoint/>
+      <!-- 方块：用 box 替代球，box 的 size 参数是半尺寸 -->
+      <geom name="target_object_geom" type="box" size="0.02 0.02 0.02"
+            rgba="0.9 0.5 0.1 1"
+            density="800"
+            friction="1 0.3 0.1"
+            solimp="0.9 0.95 0.001"
+            solref="0.01 1"
+            contype="1" conaffinity="1" group="1"/>
+
+      <!-- 方块坐标轴（视觉用，跟随 body 姿态旋转） -->
+      <geom name="target_object_x_axis" type="cylinder" size="0.004 0.05" pos="0.05 0 0" zaxis="1 0 0"
+            rgba="1 0 0 1" contype="0" conaffinity="0" group="2"/>
+      <geom name="target_object_y_axis" type="cylinder" size="0.004 0.05" pos="0 0.05 0" zaxis="0 1 0"
+            rgba="0 1 0 1" contype="0" conaffinity="0" group="2"/>
+      <geom name="target_object_z_axis" type="cylinder" size="0.004 0.05" pos="0 0 0.05" zaxis="0 0 1"
+            rgba="0 0 1 1" contype="0" conaffinity="0" group="2"/>
+
+      <site name="target_object_site" pos="0 0 0" size="0.005" rgba="0 0 1 1" group="1"/>
+    </body>
+  </worldbody>
+
+  <!-- 只在该场景启用 freejoint，因此 keyframe 也需要匹配该场景的 nq（=19） -->
+  <keyframe>
+    <key name="home"
+         qpos="-0.377 -0.628 0.88 4.9 2.2 -1.07 0.314 -2.45 -1.16 -1.63 -2.2 -2.01 -1.1 1.05 0.766 1 0 0 0"
+         ctrl="-0.377 -0.628 0.88 4.9 2.2 -1.07 0.314 -2.45 -1.16 -1.63 -2.2 -2.01"/>
+         <!-- qpos="-0.5548 -0.82903139  2.07572008 -0.67998028  1.52733763  2.61031443 0.05  -2.86530703 -1.99002441  1.0124655   1.77796691 -2.41553568 -1.1 1.05 0.766 1 0 0 0" -->
+         <!-- ctrl="-0.5548 -0.82903139  2.07572008 -0.67998028  1.52733763  2.61031443 0.05  -2.86530703 -1.99002441  1.0124655   1.77796691 -2.41553568"/> -->
+    <key name="zero"
+         qpos="0 0 0 0 0 0 0 0 0 0 0 0 -1.1 1.05 0.766 1 0 0 0"
+         ctrl="0 0 0 0 0 0 0 0 0 0 0 0"/>
+  </keyframe>
+</mujoco>

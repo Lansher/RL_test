@@ -1,0 +1,21 @@
+python - <<'PY'
+import time
+import mujoco
+import mujoco.viewer  # 关键：显式导入 viewer
+
+xml = "mujoco_asserts/universal_robots_ur5e/scene_dual_arm.xml"
+m = mujoco.MjModel.from_xml_path(xml)
+d = mujoco.MjData(m)
+
+with mujoco.viewer.launch_passive(m, d) as v:
+    v.cam.distance = 3
+    for _ in range(10000):
+        mujoco.mj_step(m, d)
+        v.sync()
+        time.sleep(0.01)
+PY
+
+
+conda run -n RL_test python rl_policy/rl_ur_train.py   --stage static   --render   --n_env 1   --total_timesteps 5000   --n_steps 64   --batch_size 64   --n_epochs 2   --learning_rate 3e-4   --log_dir ./ppo_ur_task1_v2_render/   --model_path ./ppo_ur_task1_v2_render_model.zip
+
+
