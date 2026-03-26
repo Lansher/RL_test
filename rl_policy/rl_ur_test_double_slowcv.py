@@ -14,17 +14,18 @@ from stable_baselines3.common.vec_env import VecNormalize
 # 与 rl_ur_train_double_slowcv.py 保持同名、同数值（验证时请与训练时一致）
 # slow_dynamic：全局匀速方块（每子步强制 qvel）
 DEFAULT_MAX_DELTA_CTRL = 0.08
-DEFAULT_ACTION_SMOOTHING_COEF = 0.5
+DEFAULT_ACTION_SMOOTHING_COEF = 0.4
 DEFAULT_ACTION_DEADZONE = 0.01
-DEFAULT_ACTION_RAW_LPF_COEF = 0.6
+DEFAULT_ACTION_RAW_LPF_COEF = 0.5
 DEFAULT_ACTION_BOUND = 1.0
+DEFAULT_WAIST_ACTION_SCALE = 0.6
 DEFAULT_ACTION_PENALTY_SCALE = 0.1
 DEFAULT_JOINT_LIMIT_EPSILON = 0.02
 DEFAULT_DIST_SUCCESS_START = 0.25
-DEFAULT_DIST_SUCCESS_END = 0.05
+DEFAULT_DIST_SUCCESS_END = 0.08
 DEFAULT_ORI_SUCCESS_START = 2.0
 DEFAULT_ORI_SUCCESS_END = 0.5
-DEFAULT_CURRICULUM_EPISODES = 250
+DEFAULT_CURRICULUM_EPISODES = 200
 DEFAULT_TOUCH_STOP = False
 DEFAULT_DUAL_ARM_MODE = "nearest_active"
 DEFAULT_WRIST_TABLE_PENALTY_SCALE = 0.0
@@ -54,52 +55,68 @@ def _quat_angle(q1_wxyz: np.ndarray, q2_wxyz: np.ndarray) -> float:
     return float(2.0 * np.arccos(d))
 
 
-def _quat_rotate_vector(q_wxyz: np.ndarray, v_xyz: np.ndarray) -> np.ndarray:
-    """Rotate a 3D vector by quaternion (w,x,y,z)."""
-    q = q_wxyz.astype(np.float32, copy=False)
-    v = v_xyz.astype(np.float32, copy=False)
-    q = q / (np.linalg.norm(q) + 1e-12)
-    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
-    q_vec = np.array([x, y, z], dtype=np.float32)
-
-    # v' = v + w*t + cross(q_vec, t), where t = 2*cross(q_vec, v)
-    t = 2.0 * np.cross(q_vec, v)
-    v_rot = v + w * t + np.cross(q_vec, t)
-    return v_rot
-
-
-def _tilt_yaw_ori_angle(tool_q_wxyz: np.ndarray, obj_q_wxyz: np.ndarray) -> float:
+def _z_tilt_angle_from_quat(q_wxyz: np.ndarray) -> float:
     """
-    Only enforce:
-    1) tool local +Z is tilted to point downward (world -Z),
-    2) tool yaw matches object's yaw by aligning local +X projected onto the XY plane.
-
-    Returns a single angle (rad) used as orientation error.
+    Only require tool local +Z be downward (world -Z).
+    Returns the tilt angle between tool +Z and world -Z.
     """
-    # (1) Tilt: +Z of tool vs world down (-Z)
-    z_tool_world = _quat_rotate_vector(tool_q_wxyz, np.array([0.0, 0.0, 1.0], dtype=np.float32))
-    cos_tilt = float(np.dot(z_tool_world, np.array([0.0, 0.0, -1.0], dtype=np.float32)))
-    cos_tilt = float(np.clip(cos_tilt, -1.0, 1.0))
-    tilt_err = float(np.arccos(cos_tilt))
+    q = q_wxyz / (np.linalg.norm(q_wxyz) + 1e-12)
+    w, x, y, z = [float(v) for v in q]
 
-    # (2) Yaw: align +X projected onto XY plane
-    x_tool_world = _quat_rotate_vector(tool_q_wxyz, np.array([1.0, 0.0, 0.0], dtype=np.float32))
-    x_obj_world = _quat_rotate_vector(obj_q_wxyz, np.array([1.0, 0.0, 0.0], dtype=np.float32))
+    # World Z component of tool local +Z axis: R_zz = 1 - 2(x^2 + y^2)
+    z_world = 1.0 - 2.0 * (x * x + y * y)
 
-    x_tool_xy = np.array([x_tool_world[0], x_tool_world[1], 0.0], dtype=np.float32)
-    x_obj_xy = np.array([x_obj_world[0], x_obj_world[1], 0.0], dtype=np.float32)
-    n1 = float(np.linalg.norm(x_tool_xy))
-    n2 = float(np.linalg.norm(x_obj_xy))
-    if n1 < 1e-8 or n2 < 1e-8:
-        yaw_err = float(np.pi)
-    else:
-        x_tool_xy /= n1
-        x_obj_xy /= n2
-        cos_yaw = float(np.dot(x_tool_xy, x_obj_xy))
-        cos_yaw = float(np.clip(cos_yaw, -1.0, 1.0))
-        yaw_err = float(np.arccos(cos_yaw))
+    # Align tool +Z with world -Z => dot(tool_z, -Z) = -z_world
+    cos_theta = -z_world
+    cos_theta = float(np.clip(cos_theta, -1.0, 1.0))
+    return float(np.arccos(cos_theta))
 
-    return float(max(tilt_err, yaw_err))
+
+def _tool_x_axis_xy_from_quat(q_wxyz: np.ndarray) -> np.ndarray:
+    """
+    World projection (XY) of tool local +X axis.
+    Used to align tool heading with the object's heading around Z.
+    """
+    q = q_wxyz / (np.linalg.norm(q_wxyz) + 1e-12)
+    w, x, y, z = [float(v) for v in q]
+
+    # Rotation matrix first column gives world coords of local +X:
+    # (R00, R10, R20) -> use only XY
+    vx = 1.0 - 2.0 * (y * y + z * z)
+    vy = 2.0 * (x * y + w * z)
+    return np.asarray([vx, vy], dtype=np.float32)
+
+
+def _yaw_angle_between_tool_and_obj_x_axes_xy(lquat: np.ndarray, oquat: np.ndarray) -> float:
+    """
+    Yaw alignment around Z: compare projections of local +X axes on XY plane.
+    Returns the smallest angle between the two projected vectors in [0, pi].
+    """
+    tx, ty = _tool_x_axis_xy_from_quat(lquat)
+    ox, oy = _tool_x_axis_xy_from_quat(oquat)
+
+    tn = float(np.hypot(tx, ty))
+    on = float(np.hypot(ox, oy))
+    if tn < 1e-8 or on < 1e-8:
+        return float(np.pi)
+
+    dot = float((tx * ox + ty * oy) / (tn * on))
+    dot = float(np.clip(dot, -1.0, 1.0))
+    cross_z = float((tx * oy - ty * ox) / (tn * on))
+    return float(np.arctan2(abs(cross_z), dot))
+
+
+def _orientation_error_tool_to_obj(lquat: np.ndarray, oquat: np.ndarray) -> float:
+    """
+    Combined orientation error:
+    - Z tilt error (tool +Z towards world -Z)
+    - yaw/heading error (tool +X heading aligned with object +X heading in XY)
+
+    Take max() so passing the threshold implies BOTH constraints are satisfied.
+    """
+    tilt = _z_tilt_angle_from_quat(lquat)
+    yaw = _yaw_angle_between_tool_and_obj_x_axes_xy(lquat, oquat)
+    return float(max(tilt, yaw))
 
 
 class URDualArmTask1Env(gym.Env):
@@ -122,6 +139,7 @@ class URDualArmTask1Env(gym.Env):
         action_deadzone: float = DEFAULT_ACTION_DEADZONE,
         action_raw_lpf_coef: float = DEFAULT_ACTION_RAW_LPF_COEF,
         action_bound: float = DEFAULT_ACTION_BOUND,
+        waist_action_scale: float = DEFAULT_WAIST_ACTION_SCALE,
         curriculum_episodes: int = DEFAULT_CURRICULUM_EPISODES,
         dist_success_start: float = DEFAULT_DIST_SUCCESS_START,
         dist_success_end: float = DEFAULT_DIST_SUCCESS_END,
@@ -265,6 +283,9 @@ class URDualArmTask1Env(gym.Env):
         self.action_smoothing_coef = float(action_smoothing_coef)
         self.action_deadzone = float(action_deadzone)
         self.action_raw_lpf_coef = float(action_raw_lpf_coef)
+        self.waist_action_scale = float(waist_action_scale)
+        if not (0.0 < self.waist_action_scale <= 1.0):
+            raise ValueError("waist_action_scale must be in (0, 1].")
         self.prev_ctrl = np.zeros(12, dtype=np.float32)
         self.prev_a_filtered = np.zeros(12, dtype=np.float32)
         # In single-arm debug modes we treat the other arm as "truly fixed".
@@ -589,8 +610,8 @@ class URDualArmTask1Env(gym.Env):
 
         dL = float(np.linalg.norm(lpos - opos))
         dR = float(np.linalg.norm(rpos - opos))
-        ori_angle_L = _quat_angle(lquat, oquat)
-        ori_angle_R = _quat_angle(rquat, oquat)
+        ori_angle_L = _orientation_error_tool_to_obj(lquat, oquat)
+        ori_angle_R = _orientation_error_tool_to_obj(rquat, oquat)
 
         dist_success = float(self.dist_success_current)
         ori_success = float(self.ori_success_current)
@@ -727,8 +748,8 @@ class URDualArmTask1Env(gym.Env):
 
         dL = float(np.linalg.norm(lpos - opos))
         dR = float(np.linalg.norm(rpos - opos))
-        ori_angle_L = _quat_angle(lquat, oquat)
-        ori_angle_R = _quat_angle(rquat, oquat)
+        ori_angle_L = _orientation_error_tool_to_obj(lquat, oquat)
+        ori_angle_R = _orientation_error_tool_to_obj(rquat, oquat)
 
         if self.single_arm == "left":
             d = dL
@@ -810,6 +831,10 @@ class URDualArmTask1Env(gym.Env):
                 a = np.where(np.abs(a) < self.action_deadzone, 0.0, a)
             if self.action_raw_lpf_coef > 0.0:
                 a = (1.0 - self.action_raw_lpf_coef) * a + self.action_raw_lpf_coef * self.prev_a_filtered
+
+            # Down-scale waist joints to reduce excessive base twisting.
+            a[0] *= self.waist_action_scale
+            a[6] *= self.waist_action_scale
             self.prev_a_filtered = a.astype(np.float32, copy=True)
 
             delta_q = a * self.max_delta_ctrl  # (12,)
@@ -980,6 +1005,12 @@ def main():
     parser.add_argument("--action_deadzone", type=float, default=DEFAULT_ACTION_DEADZONE)
     parser.add_argument("--action_raw_lpf_coef", type=float, default=DEFAULT_ACTION_RAW_LPF_COEF)
     parser.add_argument("--action_bound", type=float, default=DEFAULT_ACTION_BOUND)
+    parser.add_argument(
+        "--waist_action_scale",
+        type=float,
+        default=DEFAULT_WAIST_ACTION_SCALE,
+        help="Scale action on waist joints (idx 0 and 6). Must match training.",
+    )
     parser.add_argument("--curriculum_episodes", type=int, default=DEFAULT_CURRICULUM_EPISODES)
     parser.add_argument("--dist_success_start", type=float, default=DEFAULT_DIST_SUCCESS_START)
     parser.add_argument("--dist_success_end", type=float, default=DEFAULT_DIST_SUCCESS_END)
@@ -1018,6 +1049,7 @@ def main():
             ("DEFAULT_ACTION_DEADZONE", DEFAULT_ACTION_DEADZONE),
             ("DEFAULT_ACTION_RAW_LPF_COEF", DEFAULT_ACTION_RAW_LPF_COEF),
             ("DEFAULT_ACTION_BOUND", DEFAULT_ACTION_BOUND),
+            ("DEFAULT_WAIST_ACTION_SCALE", DEFAULT_WAIST_ACTION_SCALE),
             ("DEFAULT_JOINT_LIMIT_EPSILON", DEFAULT_JOINT_LIMIT_EPSILON),
             ("DEFAULT_DIST_SUCCESS_START", DEFAULT_DIST_SUCCESS_START),
             ("DEFAULT_DIST_SUCCESS_END", DEFAULT_DIST_SUCCESS_END),
@@ -1049,6 +1081,7 @@ def main():
             ("action_deadzone", args.action_deadzone),
             ("action_raw_lpf_coef", args.action_raw_lpf_coef),
             ("action_bound", args.action_bound),
+            ("waist_action_scale", args.waist_action_scale),
             ("curriculum_episodes", args.curriculum_episodes),
             ("dist_success_start", args.dist_success_start),
             ("dist_success_end", args.dist_success_end),
@@ -1080,6 +1113,7 @@ def main():
             action_deadzone=args.action_deadzone,
             action_raw_lpf_coef=args.action_raw_lpf_coef,
             action_bound=args.action_bound,
+            waist_action_scale=args.waist_action_scale,
             curriculum_episodes=args.curriculum_episodes,
             dist_success_start=args.dist_success_start,
             dist_success_end=args.dist_success_end,

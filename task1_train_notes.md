@@ -20,6 +20,8 @@
 
 **最新合并（2026-03）**：第 **§10.15** 节写入 **慢速动态 `slow_dynamic`、双机脚本 `rl_ur_*_double_slowcv.py`、全局匀速（每子步强制 `qvel`）** 及 **方块沿世界 +Y（右→左）平移、角速度为 0** 等说明。
 
+**最新合并（2026-03-26）**：第 **§10.16** 节写入本轮关于 **姿态判定口径更新** 的结论：由“完整四元数误差”改为 **`tool +Z` 朝下（world -Z）+ 与方块坐标轴（XY 平面 heading）对齐** 的组合误差；并已在 `rl_ur_train_double_slowcv.py` 与 `rl_ur_test_double_slowcv.py` 同步。
+
 ---
 
 ## 1. 原理：强化学习在做什么？
@@ -113,7 +115,7 @@ self.data.qpos[self.obj_qposadr + 3 : self.obj_qposadr + 7] = [
 
 奖励由两部分组成：
 - 位置奖励：末端到方块距离越小越好（越接近 0 越大）
-- 姿态奖励：鼓励“更近的那一臂”与方块的四元数接近（当前姿态项是 reward，用作训练信号）
+- 姿态奖励：鼓励“更近的那一臂”同时满足 **`tool +Z` 朝下** 且 **与方块轴向对齐**（slowcv 双臂脚本中已由完整四元数误差更新为组合误差）
 
 并加了一个简单碰撞惩罚：如果方块与桌面碰撞接触，则扣一点。
 
@@ -123,13 +125,18 @@ self.data.qpos[self.obj_qposadr + 3 : self.obj_qposadr + 7] = [
 dL = ||left_tool - block||
 dR = ||right_tool - block||
 
-ori_angle_L = quat_angle(left_tool_quat, block_quat)
-ori_angle_R = quat_angle(right_tool_quat, block_quat)
+ori_angle_L = orientation_error_tool_to_obj(left_tool_quat, block_quat)
+ori_angle_R = orientation_error_tool_to_obj(right_tool_quat, block_quat)
 
 success_left  = (dL < dist_success) and (ori_angle_L < ori_success)
 success_right = (dR < dist_success) and (ori_angle_R < ori_success)
-success_now = success_left or success_right  # “任一臂 6DOF 对齐”
+success_now = success_left or success_right
 ```
+
+其中 `orientation_error_tool_to_obj` 在 slowcv 双臂脚本中定义为：
+- `tilt_error`：工具局部 `+Z` 与世界 `-Z` 的夹角（要求“始终朝下”）
+- `yaw_error`：工具局部 `+X` 与方块局部 `+X` 在 XY 平面的夹角（要求“与方块坐标轴对齐”）
+- `ori_error = max(tilt_error, yaw_error)`（用 `max` 保证两项都满足才过阈值）
 
 此外还有 `success_hold_steps`：
 - `success_now=True` 只表示“某一步刚满足阈值”
@@ -805,5 +812,61 @@ conda run -n RL_test python rl_policy/rl_ur_train.py \
 - **`--obj_lin_speed`**：沿 **+Y** 的线速度大小（m/s）。
 - **`--obj_ang_speed`**：保留兼容；slow_dynamic 下**不使用**（角速度为 0）。
 - 评估时 **`--obj_lin_speed` / `--stage`** 须与训练一致。
+
+### 10.16 对话合并：姿态成功判定更新（+Z 朝下 + 轴向对齐，2026-03-26）
+
+本节合并本轮对话中对“姿态定义”的最终结论，并统一训练/测试口径，避免再出现“只要求朝下但不对齐”或“完整四元数过约束导致腕部奇异”的混淆。
+
+#### 10.16.1 需求澄清（最终口径）
+
+用户最终要求不是“只看 `tool +Z` 朝下”，而是**同时**满足：
+
+1. **`tool +Z` 始终朝下**（对齐世界 `-Z`）  
+2. **工具坐标轴与方块坐标轴对齐**（在桌面任务中重点是绕 `Z` 的 heading/yaw 对齐）
+
+因此姿态成功条件应保留“垂直下压”与“轴向对齐”两项，而不是只保留单轴倾斜角。
+
+#### 10.16.2 已落地代码（train/test 同步）
+
+文件：
+- `rl_policy/rl_ur_train_double_slowcv.py`
+- `rl_policy/rl_ur_test_double_slowcv.py`
+
+已新增并使用如下逻辑：
+
+- `z_tilt_angle_from_quat(q)`：计算工具局部 `+Z` 与世界 `-Z` 的夹角 `tilt_error`
+- `yaw_angle_between_tool_and_obj_x_axes_xy(lquat, oquat)`：比较工具与方块局部 `+X` 在 XY 平面的夹角 `yaw_error`
+- `orientation_error_tool_to_obj(lquat, oquat) = max(tilt_error, yaw_error)`
+
+并将 `_success_now()` 与 `_compute_reward_done()` 中原先的：
+
+`_quat_angle(tool_quat, obj_quat)`
+
+替换为：
+
+`_orientation_error_tool_to_obj(tool_quat, obj_quat)`
+
+这样训练与评估对“姿态达标”的定义一致。
+
+#### 10.16.3 为什么用 `max(tilt, yaw)` 而不是加权和
+
+- 用 `max` 时，`ori_error < ori_success` 等价于“**tilt 和 yaw 两项都小于阈值**”。
+- 若用加权和，可能出现“一项很差但被另一项抵消”的误判，不符合“必须既朝下又对齐轴向”的任务约束。
+
+#### 10.16.4 参数解释与调参建议（对应新口径）
+
+- `ori_success_end` 现在可直观理解为“tilt 与 yaw 都要小于该角度阈值（弧度）”。
+- 若策略先学会靠近但姿态不过关，可先放宽 `ori_success_start/end`，待稳定后再逐步收紧。
+- 建议优先排查顺序：
+  1) `dist_success_end` 是否可达  
+  2) `ori_success_end` 是否过严  
+  3) 是否出现腕部撞桌导致早终（已加入早终可抑制 reward hacking）
+
+#### 10.16.5 文档口径说明
+
+本笔记包含多轮迭代记录（章节编号按历史保留，个别小节顺序不严格按时间）。后续以本节与 §10.15 的组合为准：
+
+- §10.15：慢速动态目标（全局匀速 +Y）
+- §10.16：姿态成功定义（+Z 朝下 + 与方块轴向对齐）
 
 ---
