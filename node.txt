@@ -1,7 +1,7 @@
 python - <<'PY'
 import time
 import mujoco
-import mujoco.viewer  # ¹Ø¼ü£ºÏÔÊ½µ¼Èë viewer
+import mujoco.viewer  # ï¿½Ø¼ï¿½ï¿½ï¿½ï¿½ï¿½Ê½ï¿½ï¿½ï¿½ï¿½ viewer
 
 xml = "mujoco_asserts/universal_robots_ur5e/scene_dual_arm.xml"
 m = mujoco.MjModel.from_xml_path(xml)
@@ -16,6 +16,13 @@ with mujoco.viewer.launch_passive(m, d) as v:
 PY
 
 
-conda run -n RL_test python rl_policy/rl_ur_train.py   --stage static   --render   --n_env 1   --total_timesteps 5000   --n_steps 64   --batch_size 64   --n_epochs 2   --learning_rate 3e-4   --log_dir ./ppo_ur_task1_v2_render/   --model_path ./ppo_ur_task1_v2_render_model.zip
 
-
+conda run -n RL_test python rl_policy/rl_ur_train.py \
+  --stage static \
+  --n_env 1024 \
+  --auto_curriculum \
+  --auto_curriculum_threshold 0.85 \
+  --auto_curriculum_window 100 \
+  --total_timesteps 5000000 \
+  --log_dir ./logs/ppo_ur_task1_auto/ \
+  --model_path ./models/ppo_ur_task1_auto_model.zip

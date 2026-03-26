@@ -1,5 +1,6 @@
 import argparse
 import os
+import warnings
 from typing import Tuple
 
 import gym
@@ -9,6 +10,23 @@ from gym import spaces
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import VecNormalize
+
+# 与 rl_ur_train.py 保持同名、同数值（验证时请与训练时一致）
+DEFAULT_MAX_DELTA_CTRL = 0.08
+DEFAULT_ACTION_SMOOTHING_COEF = 0.75
+DEFAULT_ACTION_DEADZONE = 0.01
+DEFAULT_ACTION_RAW_LPF_COEF = 0.90
+DEFAULT_ACTION_BOUND = 1.0
+DEFAULT_JOINT_LIMIT_EPSILON = 0.02
+DEFAULT_DIST_SUCCESS_START = 0.30
+DEFAULT_DIST_SUCCESS_END = 0.12
+DEFAULT_ORI_SUCCESS_START = 2.0
+DEFAULT_ORI_SUCCESS_END = 0.85
+DEFAULT_CURRICULUM_EPISODES = 8000
+DEFAULT_TOUCH_STOP = False
+DEFAULT_DUAL_ARM_MODE = "nearest_active"
+DEFAULT_WRIST_TABLE_PENALTY_SCALE = 2.0
+DEFAULT_MODEL_PATH = "./models/ppo_ur_task1_run_v3_model.zip"
 
 
 def _quat_dot(q1_wxyz: np.ndarray, q2_wxyz: np.ndarray) -> float:
@@ -35,7 +53,21 @@ class URDualArmTask1Env(gym.Env):
         fixed_target: bool = False,
         success_bonus: float = 100.0,
         collision_penalty_scale: float = 0.0,
+        wrist_table_penalty_scale: float = DEFAULT_WRIST_TABLE_PENALTY_SCALE,
         action_penalty_scale: float = 0.0,
+        max_delta_ctrl: float = DEFAULT_MAX_DELTA_CTRL,
+        joint_limit_epsilon: float = DEFAULT_JOINT_LIMIT_EPSILON,
+        action_smoothing_coef: float = DEFAULT_ACTION_SMOOTHING_COEF,
+        action_deadzone: float = DEFAULT_ACTION_DEADZONE,
+        action_raw_lpf_coef: float = DEFAULT_ACTION_RAW_LPF_COEF,
+        action_bound: float = DEFAULT_ACTION_BOUND,
+        curriculum_episodes: int = DEFAULT_CURRICULUM_EPISODES,
+        dist_success_start: float = DEFAULT_DIST_SUCCESS_START,
+        dist_success_end: float = DEFAULT_DIST_SUCCESS_END,
+        ori_success_start: float = DEFAULT_ORI_SUCCESS_START,
+        ori_success_end: float = DEFAULT_ORI_SUCCESS_END,
+        touch_stop: bool = DEFAULT_TOUCH_STOP,
+        dual_arm_mode: str = DEFAULT_DUAL_ARM_MODE,
     ):
         super().__init__()
         self.stage = stage
@@ -46,10 +78,14 @@ class URDualArmTask1Env(gym.Env):
 
         if single_arm not in {"none", "left", "right"}:
             raise ValueError("single_arm must be one of: none, left, right")
+        if dual_arm_mode not in ("both", "nearest_active"):
+            raise ValueError("dual_arm_mode must be 'both' or 'nearest_active'")
         self.single_arm = single_arm
+        self.dual_arm_mode = dual_arm_mode
         self.fixed_target = bool(fixed_target)
         self.success_bonus = float(success_bonus)
         self.collision_penalty_scale = float(collision_penalty_scale)
+        self.wrist_table_penalty_scale = float(wrist_table_penalty_scale)
         self.action_penalty_scale = float(action_penalty_scale)
 
         script_dir = os.path.dirname(os.path.realpath(__file__))
@@ -82,6 +118,29 @@ class URDualArmTask1Env(gym.Env):
         self.table_geom_id = mujoco.mj_name2id(
             self.model, mujoco.mjtObj.mjOBJ_GEOM, "worktable_top"
         )
+        # Base mesh collision geometry (for avoiding/eliminating interpenetration).
+        self.base_geom_id = mujoco.mj_name2id(
+            self.model, mujoco.mjtObj.mjOBJ_GEOM, "base_col"
+        )
+
+        # Cache robot collision geom ids by body name prefix.
+        self.robot_geom_ids = set()
+        for gid in range(int(self.model.ngeom)):
+            bodyid = int(self.model.geom_bodyid[gid])
+            body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bodyid)
+            if body_name and (body_name.startswith("left_") or body_name.startswith("right_")):
+                self.robot_geom_ids.add(int(gid))
+
+        self.wrist_geom_ids = set()
+        for gid in range(int(self.model.ngeom)):
+            bodyid = int(self.model.geom_bodyid[gid])
+            body_name = mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_BODY, bodyid)
+            if body_name and (
+                "_wrist_1_link" in body_name
+                or "_wrist_2_link" in body_name
+                or "_wrist_3_link" in body_name
+            ):
+                self.wrist_geom_ids.add(int(gid))
 
         self.joint_names = [
             "left_shoulder_pan_joint",
@@ -121,11 +180,38 @@ class URDualArmTask1Env(gym.Env):
         self.robot_qpos_adrs = np.asarray(self.robot_qpos_adrs, dtype=np.int64)  # (12,)
         self.robot_qvel_adrs = np.asarray(self.robot_qvel_adrs, dtype=np.int64)  # (12,)
 
-        self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(12,), dtype=np.float32)
+        if action_bound <= 0.0:
+            raise ValueError("action_bound must be positive.")
+        self.action_bound = float(action_bound)
+        self.action_space = spaces.Box(
+            low=-self.action_bound,
+            high=self.action_bound,
+            shape=(12,),
+            dtype=np.float32,
+        )
 
         # Rate limit joint targets to reduce "target jumps" -> contact instability.
-        self.max_delta_ctrl = 0.15  # rad per decision step
+        self.max_delta_ctrl = float(max_delta_ctrl)  # rad per decision step
+        # If a joint is already near a limit, suppress delta that would push it further.
+        self.joint_limit_epsilon = float(joint_limit_epsilon)
+        # Low-pass filter for delta_q to reduce high-frequency chatter.
+        self.action_smoothing_coef = float(action_smoothing_coef)
+        self.action_deadzone = float(action_deadzone)
+        self.action_raw_lpf_coef = float(action_raw_lpf_coef)
         self.prev_ctrl = np.zeros(12, dtype=np.float32)
+        self.prev_a_filtered = np.zeros(12, dtype=np.float32)
+        # In single-arm debug modes we treat the other arm as "truly fixed".
+        # We will hard-hold the fixed arm's qpos/qvel during rollout.
+        self.fixed_hold_qpos = None
+        self.fixed_hold_qvel = None
+
+        # Touch-stop (freeze on first contact with target). Disable for RL training if needed.
+        self.touch_stop_enabled = bool(touch_stop)
+        self.has_touched_object = False
+        self.touch_hold_qpos = None
+        self.prev_delta_q = np.zeros(12, dtype=np.float32)
+        self.home_left_qpos = None
+        self.home_right_qpos = None
 
         # Observation:
         # robot_qpos(12) + robot_qvel(12) + lpos/lquat/rpos/rquat(14) +
@@ -164,12 +250,15 @@ class URDualArmTask1Env(gym.Env):
         self.table_top_z = 0.73  # legacy
         self.obj_clearance = 0.016
 
-        # Curriculum + success gating:
-        self.dist_success_start = 0.30
-        self.dist_success_end = 0.12
-        self.ori_success_start = 2.0  # rad (~114deg)
-        self.ori_success_end = 1.0  # rad (~57deg)
-        self.curriculum_episodes = 200
+        if dist_success_end <= 0.0 or dist_success_end > dist_success_start:
+            raise ValueError("Need 0 < dist_success_end <= dist_success_start.")
+        if ori_success_end <= 0.0 or ori_success_end >= ori_success_start:
+            raise ValueError("Need 0 < ori_success_end < ori_success_start.")
+        self.dist_success_start = float(dist_success_start)
+        self.dist_success_end = float(dist_success_end)
+        self.ori_success_start = float(ori_success_start)
+        self.ori_success_end = float(ori_success_end)
+        self.curriculum_episodes = max(1, int(curriculum_episodes))
         self.success_hold_steps = 1
 
         # Small x/y randomization around worktable top center
@@ -201,8 +290,9 @@ class URDualArmTask1Env(gym.Env):
         return obj_pos, obj_quat, obj_linvel, obj_angvel
 
     def _map_action_to_ctrl(self, action: np.ndarray) -> np.ndarray:
-        a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
-        normalized = (a + 1.0) / 2.0
+        b = float(self.action_bound)
+        a = np.clip(np.asarray(action, dtype=np.float32), -b, b)
+        normalized = (a + b) / (2.0 * b)
         lo = self.joint_limits[:, 0]
         hi = self.joint_limits[:, 1]
         ctrl = lo + normalized * (hi - lo)
@@ -222,30 +312,75 @@ class URDualArmTask1Env(gym.Env):
         self.step_number = 0
         self.goal_reached = False
 
-        # Place object at the current worktable_top center (x/y)
+        # Place object at the current worktable_top center (x/y).
         table_top_world_xy = np.array(
             self.data.geom_xpos[self.table_geom_id][:2], dtype=np.float32
         )
+        table_top_world_z = float(self.data.geom_xpos[self.table_geom_id][2])
+        obj_z = table_top_world_z + float(self.obj_half_extents[2]) + float(self.obj_clearance)
+
         obj_x = float(table_top_world_xy[0])
         obj_y = float(table_top_world_xy[1])
+        yaw = 0.0 if self.fixed_target else float(self.np_random.uniform(-np.pi, np.pi))
 
+        # If using random x/y, avoid spawning unreachable targets.
         if self.xy_randomize and not self.fixed_target:
             table_half = np.array(self.model.geom_size[self.table_geom_id][:2], dtype=np.float32)
             avail = np.maximum(table_half - self.xy_safe_margin, 0.0)
             max_off = avail
-            dx = float(self.np_random.uniform(-max_off[0], max_off[0]))
-            dy = float(self.np_random.uniform(-max_off[1], max_off[1]))
-            obj_x += dx
-            obj_y += dy
 
-        # Place object on top of the table (use actual world z from geom_xpos)
-        table_top_world_z = float(self.data.geom_xpos[self.table_geom_id][2])
-        obj_z = table_top_world_z + float(self.obj_half_extents[2]) + float(self.obj_clearance)
+            # Reachability threshold (meters).
+            reach_dist = float(self.dist_success_current) * 1.6
+            reach_dist = float(np.clip(reach_dist, 0.2, 0.6))
+
+            max_attempts = 25
+            accepted = False
+            for _ in range(max_attempts):
+                cand_x = obj_x + float(self.np_random.uniform(-max_off[0], max_off[0]))
+                cand_y = obj_y + float(self.np_random.uniform(-max_off[1], max_off[1]))
+                cand_yaw = float(self.np_random.uniform(-np.pi, np.pi))
+
+                # Candidate placement.
+                self.data.qpos[self.obj_qposadr : self.obj_qposadr + 3] = np.array(
+                    [cand_x, cand_y, obj_z], dtype=np.float32
+                )
+                self.data.qpos[self.obj_qposadr + 3 : self.obj_qposadr + 7] = np.array(
+                    [0.0, np.cos(cand_yaw / 2.0), np.sin(cand_yaw / 2.0), 0.0],
+                    dtype=np.float32,
+                )
+
+                mujoco.mj_forward(self.model, self.data)
+
+                opos = np.array(self.data.body(self.obj_body_id).xpos, dtype=np.float32)
+                lpos = np.array(self.data.site(self.left_site_id).xpos, dtype=np.float32)
+                rpos = np.array(self.data.site(self.right_site_id).xpos, dtype=np.float32)
+                dL = float(np.linalg.norm(lpos - opos))
+                dR = float(np.linalg.norm(rpos - opos))
+
+                if self.single_arm == "left":
+                    ok = dL < reach_dist
+                elif self.single_arm == "right":
+                    ok = dR < reach_dist
+                else:
+                    ok = min(dL, dR) < reach_dist
+
+                if ok:
+                    obj_x = cand_x
+                    obj_y = cand_y
+                    yaw = cand_yaw
+                    accepted = True
+                    break
+
+            # If not accepted, keep the last sampled obj_x/obj_y/yaw.
+            if not accepted:
+                self.data.qpos[self.obj_qposadr : self.obj_qposadr + 3] = np.array(
+                    [obj_x, obj_y, obj_z], dtype=np.float32
+                )
+
+        # Final placement.
         self.data.qpos[self.obj_qposadr : self.obj_qposadr + 3] = np.array(
             [obj_x, obj_y, obj_z], dtype=np.float32
         )
-
-        yaw = 0.0 if self.fixed_target else float(self.np_random.uniform(-np.pi, np.pi))
         self.data.qpos[self.obj_qposadr + 3 : self.obj_qposadr + 7] = np.array(
             [0.0, np.cos(yaw / 2.0), np.sin(yaw / 2.0), 0.0], dtype=np.float32
         )
@@ -269,9 +404,27 @@ class URDualArmTask1Env(gym.Env):
         self.data.qvel[self.obj_qveladr + 3 : self.obj_qveladr + 6] = ang_v
 
         mujoco.mj_forward(self.model, self.data)
-        self.prev_ctrl = np.asarray(self.data.ctrl, dtype=np.float32).copy()
+
+        # Initialize previous ctrl to the current joint positions at `home`.
+        robot_qpos = np.asarray(self.data.qpos[self.robot_qpos_adrs], dtype=np.float32)
+        robot_qvel = np.asarray(self.data.qvel[self.robot_qvel_adrs], dtype=np.float32)
+        self.prev_ctrl = robot_qpos.copy()
+        self.fixed_hold_qpos = robot_qpos.copy()
+        self.fixed_hold_qvel = robot_qvel.copy()
+        self.home_left_qpos = robot_qpos[0:6].astype(np.float32, copy=True)
+        self.home_right_qpos = robot_qpos[6:12].astype(np.float32, copy=True)
+        for i, aid in enumerate(self.actuator_ids):
+            self.data.ctrl[aid] = float(robot_qpos[i])
+
+        mujoco.mj_forward(self.model, self.data)
 
         obs = self._get_observation()
+
+        # Reset touch-stop state for this episode.
+        self.has_touched_object = False
+        self.touch_hold_qpos = None
+        self.prev_delta_q = np.zeros(12, dtype=np.float32)
+        self.prev_a_filtered[:] = 0.0
         return obs, {}
 
     def _get_observation(self) -> np.ndarray:
@@ -305,6 +458,137 @@ class URDualArmTask1Env(gym.Env):
         ).astype(np.float32)
         return obs
 
+    def _success_now(self) -> bool:
+        """Check success criteria at the current simulator state."""
+        lpos, lquat = self._get_site_pos_quat(self.left_site_id)
+        rpos, rquat = self._get_site_pos_quat(self.right_site_id)
+        opos, oquat, _, _ = self._get_object_pos_quat_vel()
+
+        dL = float(np.linalg.norm(lpos - opos))
+        dR = float(np.linalg.norm(rpos - opos))
+        ori_angle_L = _quat_angle(lquat, oquat)
+        ori_angle_R = _quat_angle(rquat, oquat)
+
+        dist_success = float(self.dist_success_current)
+        ori_success = float(self.ori_success_current)
+
+        success_left = (dL < dist_success) and (ori_angle_L < ori_success)
+        success_right = (dR < dist_success) and (ori_angle_R < ori_success)
+
+        if self.single_arm == "left":
+            return bool(success_left)
+        if self.single_arm == "right":
+            return bool(success_right)
+        return bool(success_left or success_right)
+
+    def _apply_fixed_arm_hold(self) -> None:
+        """Hard-hold the non-controlled arm in single-arm debug modes."""
+        if self.single_arm not in {"left", "right"}:
+            return
+        if self.fixed_hold_qpos is None or self.fixed_hold_qvel is None:
+            return
+
+        if self.single_arm == "left":
+            j_from, j_to = 6, 12  # keep right arm fixed
+        else:
+            j_from, j_to = 0, 6  # keep left arm fixed
+
+        qpos_ids = self.robot_qpos_adrs[j_from:j_to]
+        qvel_ids = self.robot_qvel_adrs[j_from:j_to]
+        self.data.qpos[qpos_ids] = self.fixed_hold_qpos[j_from:j_to]
+        self.data.qvel[qvel_ids] = 0.0
+
+        # Refresh fixed-arm ctrl so the position servo keeps the same target.
+        for i in range(j_from, j_to):
+            aid = self.actuator_ids[i]
+            self.data.ctrl[aid] = float(self.fixed_hold_qpos[i])
+
+    def _apply_nearest_inactive_arm_home_hold(self) -> None:
+        if self.single_arm != "none":
+            return
+        if self.dual_arm_mode != "nearest_active":
+            return
+        if self.home_left_qpos is None or self.home_right_qpos is None:
+            return
+        lpos, _ = self._get_site_pos_quat(self.left_site_id)
+        rpos, _ = self._get_site_pos_quat(self.right_site_id)
+        opos, _, _, _ = self._get_object_pos_quat_vel()
+        dL = float(np.linalg.norm(lpos - opos))
+        dR = float(np.linalg.norm(rpos - opos))
+        if dL <= dR:
+            j_from, j_to = 6, 12
+            hold = self.home_right_qpos
+        else:
+            j_from, j_to = 0, 6
+            hold = self.home_left_qpos
+        qpos_ids = self.robot_qpos_adrs[j_from:j_to]
+        qvel_ids = self.robot_qvel_adrs[j_from:j_to]
+        self.data.qpos[qpos_ids] = hold
+        self.data.qvel[qvel_ids] = 0.0
+        for i in range(j_from, j_to):
+            self.data.ctrl[self.actuator_ids[i]] = float(hold[i - j_from])
+
+    def _object_touched_by_robot(self) -> bool:
+        """Return True when target_object geom is in contact with something other than the table."""
+        if self.target_geom_id < 0:
+            return False
+        table_id = int(self.table_geom_id) if self.table_geom_id >= 0 else -1
+
+        for c in self.data.contact:
+            g1, g2 = int(c.geom1), int(c.geom2)
+            if g1 == self.target_geom_id and g2 != table_id:
+                return True
+            if g2 == self.target_geom_id and g1 != table_id:
+                return True
+        return False
+
+    def _is_robot_geom_contact_pair(self, g1: int, g2: int) -> bool:
+        """True if contact is between two robot geoms and not involving the target."""
+        if g1 in self.robot_geom_ids and g2 in self.robot_geom_ids:
+            if g1 == int(self.target_geom_id) or g2 == int(self.target_geom_id):
+                return False
+            return True
+        return False
+
+    def _robot_self_or_base_collision(self) -> bool:
+        """Detect collisions that usually cause whipping: robot-robot or robot-base_col."""
+        if self.base_geom_id < 0 and not self.robot_geom_ids:
+            return False
+
+        for c in self.data.contact:
+            g1, g2 = int(c.geom1), int(c.geom2)
+
+            # Ignore any contact involving the target object.
+            if g1 == int(self.target_geom_id) or g2 == int(self.target_geom_id):
+                continue
+
+            # base_col collision
+            if self.base_geom_id >= 0 and (g1 == int(self.base_geom_id) or g2 == int(self.base_geom_id)):
+                return True
+
+            # robot self collision (including left-right)
+            if (g1 in self.robot_geom_ids) and (g2 in self.robot_geom_ids):
+                return True
+
+        return False
+
+    def _apply_touch_hold(self) -> None:
+        """Freeze all robot joints at the stored touch pose."""
+        if not self.touch_stop_enabled:
+            return
+        if not self.has_touched_object:
+            return
+        if self.touch_hold_qpos is None:
+            return
+
+        qpos_ids = self.robot_qpos_adrs
+        qvel_ids = self.robot_qvel_adrs
+        self.data.qpos[qpos_ids] = self.touch_hold_qpos
+        self.data.qvel[qvel_ids] = 0.0
+
+        for i, aid in enumerate(self.actuator_ids):
+            self.data.ctrl[aid] = float(self.touch_hold_qpos[i])
+
     def _compute_reward_done(self):
         lpos, lquat = self._get_site_pos_quat(self.left_site_id)
         rpos, rquat = self._get_site_pos_quat(self.right_site_id)
@@ -326,18 +610,43 @@ class URDualArmTask1Env(gym.Env):
             d = 0.5 * dL + 0.5 * dR
             ori_angle = 0.5 * ori_angle_L + 0.5 * ori_angle_R
 
-        pos_reward = -np.arctan(d)
+        # Positive shaping: closer -> larger reward in (0, 1], far -> ~0.
+        pos_reward = float(1.0 / (1.0 + 5.0 * d))
         ori_reward = -0.4 * np.arctan(float(ori_angle))
 
         collision_penalty = 0.0
         if self.collision_penalty_scale != 0.0:
-            if self.table_geom_id >= 0 and self.target_geom_id >= 0:
-                for c in self.data.contact:
+            for c in self.data.contact:
+                # 1) Original collision: table <-> target
+                if self.table_geom_id >= 0 and self.target_geom_id >= 0:
                     if (c.geom1 == self.table_geom_id and c.geom2 == self.target_geom_id) or (
                         c.geom2 == self.table_geom_id and c.geom1 == self.target_geom_id
                     ):
                         collision_penalty -= float(self.collision_penalty_scale)
                         break
+
+                # 2) Additional collision: robot <-> base mesh (base_col)
+                if self.base_geom_id >= 0:
+                    if c.geom1 == self.base_geom_id or c.geom2 == self.base_geom_id:
+                        collision_penalty -= float(self.collision_penalty_scale)
+                        break
+
+                # 3) Additional collision: robot self collision (robot <-> robot)
+                if self._is_robot_geom_contact_pair(int(c.geom1), int(c.geom2)):
+                    collision_penalty -= float(self.collision_penalty_scale)
+                    break
+
+        wrist_table_penalty = 0.0
+        if self.wrist_table_penalty_scale != 0.0 and self.table_geom_id >= 0 and self.wrist_geom_ids:
+            tid = int(self.table_geom_id)
+            for c in self.data.contact:
+                g1, g2 = int(c.geom1), int(c.geom2)
+                if g1 == tid and g2 in self.wrist_geom_ids:
+                    wrist_table_penalty -= float(self.wrist_table_penalty_scale)
+                    break
+                if g2 == tid and g1 in self.wrist_geom_ids:
+                    wrist_table_penalty -= float(self.wrist_table_penalty_scale)
+                    break
 
         dist_success = float(self.dist_success_current)
         ori_success = float(self.ori_success_current)
@@ -352,20 +661,64 @@ class URDualArmTask1Env(gym.Env):
             success_now = bool(success_left or success_right)
 
         success_bonus_now = self.success_bonus if success_now else 0.0
-        reward = pos_reward + ori_reward + collision_penalty + success_bonus_now
+        reward = pos_reward + ori_reward + collision_penalty + wrist_table_penalty + success_bonus_now
         return float(reward), bool(success_now)
 
     def step(self, action):
-        # Incremental delta control: action in [-1, 1] maps to delta joint radians.
-        a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)  # (12,)
-        delta_q = a * self.max_delta_ctrl  # (12,)
-        ctrl_target = self.prev_ctrl + delta_q
+        # Touch-stop: if we already touched the object, keep ctrl frozen.
+        if self.touch_stop_enabled and self.has_touched_object:
+            ctrl_target = self.prev_ctrl
+        else:
+            # Incremental delta control: a in [-action_bound, action_bound] maps to delta joint radians.
+            a = np.clip(
+                np.asarray(action, dtype=np.float32),
+                -self.action_bound,
+                self.action_bound,
+            )  # (12,)
+            if self.action_deadzone > 0.0:
+                a = np.where(np.abs(a) < self.action_deadzone, 0.0, a)
+            if self.action_raw_lpf_coef > 0.0:
+                a = (1.0 - self.action_raw_lpf_coef) * a + self.action_raw_lpf_coef * self.prev_a_filtered
+            self.prev_a_filtered = a.astype(np.float32, copy=True)
+
+            delta_q = a * self.max_delta_ctrl  # (12,)
+
+            # Boundary suppression to reduce high-frequency oscillation at joint limits.
+            q_now = np.asarray(self.data.qpos[self.robot_qpos_adrs], dtype=np.float32)
+            lo = self.joint_limits[:, 0]
+            hi = self.joint_limits[:, 1]
+            at_hi = q_now >= (hi - self.joint_limit_epsilon)
+            at_lo = q_now <= (lo + self.joint_limit_epsilon)
+            delta_q = np.where(at_hi & (delta_q > 0.0), 0.0, delta_q)
+            delta_q = np.where(at_lo & (delta_q < 0.0), 0.0, delta_q)
+
+            # Low-pass filter delta_q to reduce high-frequency chatter.
+            if self.action_smoothing_coef != 0.0:
+                delta_q = (1.0 - self.action_smoothing_coef) * delta_q + self.action_smoothing_coef * self.prev_delta_q
+            self.prev_delta_q = delta_q.astype(np.float32, copy=True)
+
+            ctrl_target = self.prev_ctrl + delta_q
 
         # Single-arm mode: keep the other arm fixed.
         if self.single_arm == "left":
             ctrl_target[6:] = self.prev_ctrl[6:]
         elif self.single_arm == "right":
             ctrl_target[:6] = self.prev_ctrl[:6]
+
+        if self.single_arm == "none" and self.dual_arm_mode == "nearest_active":
+            lpos, _ = self._get_site_pos_quat(self.left_site_id)
+            rpos, _ = self._get_site_pos_quat(self.right_site_id)
+            opos, _, _, _ = self._get_object_pos_quat_vel()
+            dL = float(np.linalg.norm(lpos - opos))
+            dR = float(np.linalg.norm(rpos - opos))
+            if dL <= dR:
+                ctrl_target[6:12] = self.home_right_qpos
+                self.prev_delta_q[6:12] = 0.0
+                self.prev_a_filtered[6:12] = 0.0
+            else:
+                ctrl_target[0:6] = self.home_left_qpos
+                self.prev_delta_q[0:6] = 0.0
+                self.prev_a_filtered[0:6] = 0.0
 
         # Clip to joint limits for safety.
         lo = self.joint_limits[:, 0]
@@ -377,10 +730,39 @@ class URDualArmTask1Env(gym.Env):
             self.data.ctrl[aid] = float(ctrl[i])
 
         unstable = False
+        # Enforce hard hold on the fixed arm before stepping physics.
+        self._apply_fixed_arm_hold()
+        self._apply_nearest_inactive_arm_home_hold()
+        self._apply_touch_hold()
         for _ in range(self.frame_skip):
             mujoco.mj_step(self.model, self.data)
             if self.handle is not None:
                 self.handle.sync()
+            # Re-apply hold after physics integration to prevent drift.
+            self._apply_fixed_arm_hold()
+            self._apply_nearest_inactive_arm_home_hold()
+            self._apply_touch_hold()
+
+            # First touch detection: stop immediately to avoid post-contact bouncing.
+            if (
+                self.touch_stop_enabled
+                and (not self.has_touched_object)
+                and self._object_touched_by_robot()
+            ):
+                self.has_touched_object = True
+                self.touch_hold_qpos = np.asarray(
+                    self.data.qpos[self.robot_qpos_adrs], dtype=np.float32
+                ).copy()
+                self._apply_touch_hold()
+                break
+
+            # If we haven't touched the object yet, but the robot hits itself or the base,
+            # stop integrating further in this decision step to reduce visible whipping.
+            if (not self.has_touched_object) and self._robot_self_or_base_collision():
+                break
+            # Early stop within the same decision step when hold=1.
+            if self.success_hold_steps == 1 and self._success_now():
+                break
             if not np.isfinite(self.data.qacc).all():
                 unstable = True
                 break
@@ -389,7 +771,7 @@ class URDualArmTask1Env(gym.Env):
         obs = self._get_observation()
 
         if unstable or (not np.isfinite(obs).all()) or (not np.isfinite(self.data.qacc).all()):
-            return obs, -10.0, True, True, {"is_success": False, "unstable": True}
+            return obs, -1000.0, True, True, {"is_success": False, "unstable": True}
 
         reward, success_now = self._compute_reward_done()
         self.goal_reached = success_now
@@ -406,7 +788,11 @@ class URDualArmTask1Env(gym.Env):
             reward += 20.0
 
         if self.action_penalty_scale != 0.0:
-            a = np.clip(np.asarray(action, dtype=np.float32), -1.0, 1.0)
+            a = np.clip(
+                np.asarray(action, dtype=np.float32),
+                -self.action_bound,
+                self.action_bound,
+            )
             reward += -float(self.action_penalty_scale) * float(np.sum(np.square(a), dtype=np.float32))
 
         info = {"is_success": bool(done), "success_now": bool(success_now)}
@@ -422,21 +808,58 @@ class URDualArmTask1Env(gym.Env):
 
 
 def main():
-    parser = argparse.ArgumentParser()
+    parser = argparse.ArgumentParser(
+        description="Evaluate Task1 policy (defaults match rl_ur_train.py constants).",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument("--stage", type=str, default="static", choices=["static", "slow_dynamic"])
     parser.add_argument("--render", action="store_true")
-    parser.add_argument("--model_path", type=str, required=True)
+    parser.add_argument("--model_path", type=str, default=DEFAULT_MODEL_PATH)
     parser.add_argument("--single_arm", type=str, default="none", choices=["none", "left", "right"])
     parser.add_argument("--fixed_target", action="store_true")
+    parser.add_argument(
+        "--wrist_table_penalty_scale",
+        type=float,
+        default=DEFAULT_WRIST_TABLE_PENALTY_SCALE,
+        help="Must match training. 0 disables wrist-table penalty.",
+    )
+
+    parser.add_argument("--max_delta_ctrl", type=float, default=DEFAULT_MAX_DELTA_CTRL)
+    parser.add_argument("--joint_limit_epsilon", type=float, default=DEFAULT_JOINT_LIMIT_EPSILON)
+    parser.add_argument("--action_smoothing_coef", type=float, default=DEFAULT_ACTION_SMOOTHING_COEF)
+    parser.add_argument("--action_deadzone", type=float, default=DEFAULT_ACTION_DEADZONE)
+    parser.add_argument("--action_raw_lpf_coef", type=float, default=DEFAULT_ACTION_RAW_LPF_COEF)
+    parser.add_argument("--action_bound", type=float, default=DEFAULT_ACTION_BOUND)
+    parser.add_argument("--curriculum_episodes", type=int, default=DEFAULT_CURRICULUM_EPISODES)
+    parser.add_argument("--dist_success_start", type=float, default=DEFAULT_DIST_SUCCESS_START)
+    parser.add_argument("--dist_success_end", type=float, default=DEFAULT_DIST_SUCCESS_END)
+    parser.add_argument("--ori_success_start", type=float, default=DEFAULT_ORI_SUCCESS_START)
+    parser.add_argument("--ori_success_end", type=float, default=DEFAULT_ORI_SUCCESS_END)
+    parser.add_argument(
+        "--dual_arm_mode",
+        type=str,
+        default=DEFAULT_DUAL_ARM_MODE,
+        choices=["both", "nearest_active"],
+        help="Must match training.",
+    )
+    parser.add_argument(
+        "--touch_stop",
+        action="store_true",
+        help="Must match training. Freeze on contact (default off).",
+    )
+    parser.add_argument("--no_touch_stop", action="store_true", help=argparse.SUPPRESS)
+
     parser.add_argument(
         "--vecnormalize_path",
         type=str,
         default=None,
-        help="Path to VecNormalize stats pkl. If not set, auto-derives from model_path.",
+        help="VecNormalize pkl; default: <model_stem>_vecnormalize.pkl",
     )
     parser.add_argument("--n_episodes", type=int, default=50)
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
+    if args.no_touch_stop:
+        warnings.warn("--no_touch_stop is ignored: no freeze-on-contact is already the default.", UserWarning)
 
     if not os.path.exists(args.model_path):
         raise FileNotFoundError(args.model_path)
@@ -449,6 +872,20 @@ def main():
             seed=args.seed,
             single_arm=args.single_arm,
             fixed_target=args.fixed_target,
+            wrist_table_penalty_scale=args.wrist_table_penalty_scale,
+            max_delta_ctrl=args.max_delta_ctrl,
+            joint_limit_epsilon=args.joint_limit_epsilon,
+            action_smoothing_coef=args.action_smoothing_coef,
+            action_deadzone=args.action_deadzone,
+            action_raw_lpf_coef=args.action_raw_lpf_coef,
+            action_bound=args.action_bound,
+            curriculum_episodes=args.curriculum_episodes,
+            dist_success_start=args.dist_success_start,
+            dist_success_end=args.dist_success_end,
+            ori_success_start=args.ori_success_start,
+            ori_success_end=args.ori_success_end,
+            touch_stop=bool(args.touch_stop),
+            dual_arm_mode=args.dual_arm_mode,
         )
 
     env = make_vec_env(make_env, n_envs=1)

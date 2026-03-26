@@ -19,11 +19,12 @@
                 <joint range="-3.1415 3.1415"/>
             </default>
             <default class="position">
-                <!-- Soften aggressive position servo for contact stability -->
-                <position ctrlrange="-6.2831 6.2831" kp="700" kv="200" forcerange="-60 60"/>
+                <!-- Shoulder/pan: lower kp/kv than stock UR XML to avoid PD limit-cycles
+                     (tiny ctrl changes still produce large torques when kp~700). -->
+                <position ctrlrange="-6.2831 6.2831" kp="380" kv="140" forcerange="-60 60"/>
                 <default class="position_limited">
-                    <!-- Elbow joints: keep gains lower than the shoulder/pan -->
-                    <position ctrlrange="-3.1415 3.1415" kp="600" kv="220" forcerange="-45 45"/>
+                    <!-- Elbow joints -->
+                    <position ctrlrange="-3.1415 3.1415" kp="350" kv="130" forcerange="-45 45"/>
                 </default>
                 <default class="position_small">
                     <!-- Wrist joints: slightly reduce tracking gains -->
