@@ -35,4 +35,5 @@ MUJOCO_LOG.TXT
 # IDE / OS
 .vscode/
 .idea/
+node.txt
 .DS_Store
