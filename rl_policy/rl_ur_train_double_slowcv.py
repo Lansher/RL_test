@@ -47,7 +47,7 @@ DEFAULT_COLLISION_PENALTY_SCALE = 2.0
 DEFAULT_OBJ_LIN_SPEED = 0.2
 DEFAULT_OBJ_ANG_SPEED = 0.5
 DEFAULT_LOG_DIR = "./logs/ppo_ur_task1_slowcv_v2/"
-DEFAULT_MODEL_PATH = "./models/ppo_ur_task1_slowcv_model.zip"
+DEFAULT_MODEL_PATH = "./models/ppo_ur_task1_slowcv_model_3.zip"
 
 
 def _print_config_table(title: str, rows: list[tuple[str, object]]) -> None:

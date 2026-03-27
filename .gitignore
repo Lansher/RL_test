@@ -1,0 +1,38 @@
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# RL training artifacts
+logs/
+models/
+checkpoints/
+runs/
+ppo_*/
+**/events.out.tfevents*
+*.zip
+*.pkl
+*.npz
+*.npy
+MUJOCO_LOG.TXT
+
+# Media / large outputs
+*.mp4
+*.avi
+*.gif
+
+# Notebook / temp
+.ipynb_checkpoints/
+*.tmp
+*.temp
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store

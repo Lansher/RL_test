@@ -14,25 +14,25 @@ from stable_baselines3.common.vec_env import VecNormalize
 # 与 rl_ur_train_double_slowcv.py 保持同名、同数值（验证时请与训练时一致）
 # slow_dynamic：全局匀速方块（每子步强制 qvel）
 DEFAULT_MAX_DELTA_CTRL = 0.08
-DEFAULT_ACTION_SMOOTHING_COEF = 0.4
+DEFAULT_ACTION_SMOOTHING_COEF = 0.3
 DEFAULT_ACTION_DEADZONE = 0.01
-DEFAULT_ACTION_RAW_LPF_COEF = 0.5
+DEFAULT_ACTION_RAW_LPF_COEF = 0.4
 DEFAULT_ACTION_BOUND = 1.0
 DEFAULT_WAIST_ACTION_SCALE = 0.6
 DEFAULT_ACTION_PENALTY_SCALE = 0.1
 DEFAULT_JOINT_LIMIT_EPSILON = 0.02
 DEFAULT_DIST_SUCCESS_START = 0.25
-DEFAULT_DIST_SUCCESS_END = 0.08
+DEFAULT_DIST_SUCCESS_END = 0.05
 DEFAULT_ORI_SUCCESS_START = 2.0
 DEFAULT_ORI_SUCCESS_END = 0.5
-DEFAULT_CURRICULUM_EPISODES = 200
+DEFAULT_CURRICULUM_EPISODES = 500
 DEFAULT_TOUCH_STOP = False
 DEFAULT_DUAL_ARM_MODE = "nearest_active"
 DEFAULT_WRIST_TABLE_PENALTY_SCALE = 0.0
 DEFAULT_COLLISION_PENALTY_SCALE = 2.0
 DEFAULT_OBJ_LIN_SPEED = 0.2
-DEFAULT_OBJ_ANG_SPEED = 0.5
-DEFAULT_MODEL_PATH = "./models/ppo_ur_task1_slowcv_model.zip"
+DEFAULT_OBJ_ANG_SPEED = 0.0
+DEFAULT_MODEL_PATH = "./models/ppo_ur_task1_slowcv_model_3.zip"
 
 
 def _print_config_table(title: str, rows: list[tuple[str, object]]) -> None:
@@ -53,6 +53,59 @@ def _quat_angle(q1_wxyz: np.ndarray, q2_wxyz: np.ndarray) -> float:
     d = abs(_quat_dot(q1, q2))
     d = float(np.clip(d, -1.0, 1.0))
     return float(2.0 * np.arccos(d))
+
+
+def _quat_conjugate(q_wxyz: np.ndarray) -> np.ndarray:
+    q = np.asarray(q_wxyz, dtype=np.float32)
+    return np.asarray([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
+
+
+def _quat_multiply(q1_wxyz: np.ndarray, q2_wxyz: np.ndarray) -> np.ndarray:
+    w1, x1, y1, z1 = [float(v) for v in q1_wxyz]
+    w2, x2, y2, z2 = [float(v) for v in q2_wxyz]
+    return np.asarray(
+        [
+            w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+            w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+            w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+            w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        ],
+        dtype=np.float32,
+    )
+
+
+def _quat_rotate_vec(q_wxyz: np.ndarray, v_xyz: np.ndarray) -> np.ndarray:
+    q = np.asarray(q_wxyz, dtype=np.float32)
+    q = q / (np.linalg.norm(q) + 1e-12)
+    vq = np.asarray([0.0, float(v_xyz[0]), float(v_xyz[1]), float(v_xyz[2])], dtype=np.float32)
+    out = _quat_multiply(_quat_multiply(q, vq), _quat_conjugate(q))
+    return out[1:4].astype(np.float32, copy=False)
+
+
+def _quat_to_euler_xyz_deg(q_wxyz: np.ndarray) -> np.ndarray:
+    """Convert quaternion (wxyz) to XYZ intrinsic Euler angles in degrees."""
+    q = np.asarray(q_wxyz, dtype=np.float32)
+    q = q / (np.linalg.norm(q) + 1e-12)
+    w, x, y, z = [float(v) for v in q]
+
+    # roll (x-axis rotation)
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    roll = np.arctan2(sinr_cosp, cosr_cosp)
+
+    # pitch (y-axis rotation)
+    sinp = 2.0 * (w * y - z * x)
+    if abs(sinp) >= 1.0:
+        pitch = np.sign(sinp) * (np.pi / 2.0)
+    else:
+        pitch = np.arcsin(sinp)
+
+    # yaw (z-axis rotation)
+    siny_cosp = 2.0 * (w * z + x * y)
+    cosy_cosp = 1.0 - 2.0 * (y * y + z * z)
+    yaw = np.arctan2(siny_cosp, cosy_cosp)
+
+    return np.asarray([roll, pitch, yaw], dtype=np.float32) * (180.0 / np.pi)
 
 
 def _z_tilt_angle_from_quat(q_wxyz: np.ndarray) -> float:
@@ -602,6 +655,35 @@ class URDualArmTask1Env(gym.Env):
         ).astype(np.float32)
         return obs
 
+    def get_tool_relative_pose_to_object(self) -> dict:
+        """
+        Return object pose expressed in each tool frame at current sim state.
+        Keys:
+          - left_rel_pos, right_rel_pos: object position in tool frame (m)
+          - left_rel_quat_wxyz, right_rel_quat_wxyz: q_tool^-1 * q_obj
+        """
+        lpos, lquat = self._get_site_pos_quat(self.left_site_id)
+        rpos, rquat = self._get_site_pos_quat(self.right_site_id)
+        opos, oquat, _, _ = self._get_object_pos_quat_vel()
+
+        lquat_inv = _quat_conjugate(lquat / (np.linalg.norm(lquat) + 1e-12))
+        rquat_inv = _quat_conjugate(rquat / (np.linalg.norm(rquat) + 1e-12))
+
+        left_rel_pos = _quat_rotate_vec(lquat_inv, (opos - lpos).astype(np.float32))
+        right_rel_pos = _quat_rotate_vec(rquat_inv, (opos - rpos).astype(np.float32))
+        left_rel_quat = _quat_multiply(lquat_inv, oquat)
+        right_rel_quat = _quat_multiply(rquat_inv, oquat)
+
+        left_rel_quat = left_rel_quat / (np.linalg.norm(left_rel_quat) + 1e-12)
+        right_rel_quat = right_rel_quat / (np.linalg.norm(right_rel_quat) + 1e-12)
+
+        return {
+            "left_rel_pos": left_rel_pos.astype(np.float32),
+            "right_rel_pos": right_rel_pos.astype(np.float32),
+            "left_rel_quat_wxyz": left_rel_quat.astype(np.float32),
+            "right_rel_quat_wxyz": right_rel_quat.astype(np.float32),
+        }
+
     def _success_now(self) -> bool:
         """Check success criteria at the current simulator state."""
         lpos, lquat = self._get_site_pos_quat(self.left_site_id)
@@ -952,7 +1034,16 @@ class URDualArmTask1Env(gym.Env):
             )
             reward += -float(self.action_penalty_scale) * float(np.sum(np.square(a), dtype=np.float32))
 
-        info = {"is_success": bool(done), "success_now": bool(success_now)}
+        rel_pose = self.get_tool_relative_pose_to_object()
+        info = {
+            "is_success": bool(done),
+            "success_now": bool(success_now),
+            # Snapshot at the terminal decision step (before VecEnv auto-reset).
+            "left_rel_dist": float(np.linalg.norm(rel_pose["left_rel_pos"])),
+            "right_rel_dist": float(np.linalg.norm(rel_pose["right_rel_pos"])),
+            "left_rel_quat_wxyz": rel_pose["left_rel_quat_wxyz"].astype(np.float32),
+            "right_rel_quat_wxyz": rel_pose["right_rel_quat_wxyz"].astype(np.float32),
+        }
         return obs, reward, done, truncated, info
 
     def close(self):
@@ -1170,7 +1261,17 @@ def main():
         if last_info.get("is_success", False):
             successes += 1
 
+        ldist = float(last_info.get("left_rel_dist", np.nan))
+        rdist = float(last_info.get("right_rel_dist", np.nan))
+        lrq_raw = np.asarray(last_info.get("left_rel_quat_wxyz", [np.nan] * 4), dtype=np.float32)
+        rrq_raw = np.asarray(last_info.get("right_rel_quat_wxyz", [np.nan] * 4), dtype=np.float32)
+        lrq = np.round(lrq_raw, 4).tolist()
+        rrq = np.round(rrq_raw, 4).tolist()
+        lre = np.round(_quat_to_euler_xyz_deg(lrq_raw), 2).tolist()
+        rre = np.round(_quat_to_euler_xyz_deg(rrq_raw), 2).tolist()
         print(f"Episode {ep+1}/{args.n_episodes}: success={last_info.get('is_success', False)} reward={ep_reward:.2f}")
+        # print(f"  left_tool->obj  rel_dist(m)={ldist:.4f} rel_quat(wxyz)={lrq} rel_euler_xyz_deg={lre}")
+        print(f"  right_tool->obj rel_dist(m)={rdist:.4f} rel_euler_xyz_deg={rre}")
 
     success_rate = successes / float(args.n_episodes)
     mean_ep_reward = float(np.mean(episode_rewards))
